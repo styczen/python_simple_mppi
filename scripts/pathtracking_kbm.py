@@ -1,8 +1,12 @@
+import multiprocessing as mp
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Tuple
 from matplotlib import patches
-from matplotlib.animation import ArtistAnimation
+from matplotlib.animation import ArtistAnimation, FFMpegWriter, MovieWriter
+from matplotlib.collections import LineCollection
+from matplotlib.colors import to_rgba
 
 class Vehicle():
     def __init__(
@@ -187,12 +191,13 @@ class Vehicle():
         if sampled_traj_list.any():
             min_alpha_value = 0.25
             max_alpha_value = 0.35
-            for idx, sampled_traj in enumerate(sampled_traj_list):
-                # draw darker for better samples
-                alpha_value = (1.0 - (idx+1)/len(sampled_traj_list)) * (max_alpha_value - min_alpha_value) + min_alpha_value
-                sampled_traj_x_offset = np.ravel(sampled_traj[:, 0]) - np.full(sampled_traj.shape[0], x)
-                sampled_traj_y_offset = np.ravel(sampled_traj[:, 1]) - np.full(sampled_traj.shape[0], y)
-                frame += self.main_ax.plot(sampled_traj_x_offset, sampled_traj_y_offset, color='gray', linestyle="solid", linewidth=0.2, zorder=4, alpha=alpha_value)
+            n_samples = len(sampled_traj_list)
+            # draw darker for better samples
+            alpha_values = (1.0 - np.arange(1, n_samples+1)/n_samples) * (max_alpha_value - min_alpha_value) + min_alpha_value
+            colors = np.tile(to_rgba('gray'), (n_samples, 1))
+            colors[:, 3] = alpha_values
+            segments = sampled_traj_list[:, :, :2] - np.array([x, y])
+            frame += [self.main_ax.add_collection(LineCollection(segments, colors=colors, linewidths=0.2, zorder=4), autolim=False)]
 
         ### mini map view ###
         frame += self.minimap_ax.plot(self.ref_path[:, 0], self.ref_path[:,1], color='black', linestyle='dashed')
@@ -248,6 +253,47 @@ class Vehicle():
         """save animation of the recorded frames (ffmpeg required)"""
         ani = ArtistAnimation(self.fig, self.frames, interval=interval)
         ani.save(filename, writer=movie_writer)
+
+    def record_frame(self, writer: MovieWriter, steer: float, accel: float, optimal_traj: np.ndarray, sampled_traj_list: np.ndarray) -> None:
+        """draw the current state, write it to the movie and discard its artists"""
+        steer = np.clip(steer, -self.max_steer_abs, self.max_steer_abs)
+        accel = np.clip(accel, -self.max_accel_abs, self.max_accel_abs)
+        self.append_frame(steer, accel, optimal_traj, sampled_traj_list)
+        writer.grab_frame()
+        for artist in self.frames.pop():
+            artist.remove()
+
+
+class BackgroundRecorder():
+    """render frames and encode them to a movie file in a separate process while the simulation runs"""
+
+    def __init__(self, filename: str, fps: float, max_queued_frames: int = 100, **vehicle_kwargs) -> None:
+        ctx = mp.get_context("spawn")
+        # bounded, so the simulation waits for the renderer instead of buffering frames without limit
+        self.queue = ctx.Queue(maxsize=max_queued_frames)
+        self.process = ctx.Process(target=_record_worker, args=(self.queue, filename, fps, vehicle_kwargs))
+        self.process.start()
+
+    def add_frame(self, state: np.ndarray, steer: float, accel: float, optimal_traj: np.ndarray, sampled_traj_list: np.ndarray) -> None:
+        self.queue.put((state, steer, accel, optimal_traj, sampled_traj_list))
+
+    def close(self) -> None:
+        """wait until all queued frames are written"""
+        self.queue.put(None)
+        self.process.join()
+
+
+def _record_worker(queue: mp.Queue, filename: str, fps: float, vehicle_kwargs: dict) -> None:
+    # own process group, so Ctrl+C in the terminal does not kill this process and its ffmpeg child mid-write
+    os.setpgrp()
+    plt.switch_backend("Agg")
+    vehicle = Vehicle(visualize=True, **vehicle_kwargs)
+    writer = FFMpegWriter(fps=fps)
+    with writer.saving(vehicle.fig, filename, dpi=vehicle.fig.dpi):
+        while (item := queue.get()) is not None:
+            state, steer, accel, optimal_traj, sampled_traj_list = item
+            vehicle.state = state
+            vehicle.record_frame(writer, steer, accel, optimal_traj, sampled_traj_list)
 
 if __name__ == "__main__":
     # test simulation with example control input

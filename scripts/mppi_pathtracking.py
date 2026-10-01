@@ -1,7 +1,8 @@
+import itertools
 import math
 import numpy as np
 from typing import Tuple
-from pathtracking_kbm import Vehicle
+from pathtracking_kbm import Vehicle, BackgroundRecorder
 
 class MPPIControllerForPathTracking():
     def __init__(
@@ -44,6 +45,8 @@ class MPPIControllerForPathTracking():
         self.max_steer_abs = max_steer_abs # [rad]
         self.max_accel_abs = max_accel_abs # [m/s^2]
         self.ref_path = ref_path
+        self.Sigma_inv = np.linalg.inv(self.Sigma)
+        self.u_limit = np.array([self.max_steer_abs, self.max_accel_abs])
 
         # mppi variables
         self.u_prev = np.zeros((self.T, self.dim_u))
@@ -61,51 +64,31 @@ class MPPIControllerForPathTracking():
 
         # get the waypoint closest to current vehicle position 
         self._get_nearest_waypoint(x0[0], x0[1], update_prev_idx=True)
-        if self.prev_waypoints_idx >= self.ref_path.shape[0]-1:
-            print("[ERROR] Reached the end of the reference path.")
-            raise IndexError
-
-        # prepare buffer
-        S = np.zeros((self.K)) # state cost list
 
         # sample noise
         epsilon = self._calc_epsilon(self.Sigma, self.K, self.T, self.dim_u) # size is self.K x self.T
 
-        # prepare buffer of sampled control input sequence
-        v = np.zeros((self.K, self.T, self.dim_u)) # control input sequence with noise
+        # control input sequence with noise: exploitation samples first, exploration samples after
+        n_exploit = math.ceil((1.0 - self.param_exploration) * self.K)
+        v = epsilon.copy()
+        v[:n_exploit] += u
+        v = np.clip(v, -self.u_limit, self.u_limit)
 
-        # loop for 0 ~ K-1 samples
-        for k in range(self.K):         
-
-            # set initial(t=0) state x i.e. observed state of the vehicle
-            x = x0
-
-            # loop for time step t = 1 ~ T
-            for t in range(1, self.T+1):
-
-                # get control input with noise
-                if k < (1.0-self.param_exploration)*self.K:
-                    v[k, t-1] = u[t-1] + epsilon[k, t-1] # sampling for exploitation
-                else:
-                    v[k, t-1] = epsilon[k, t-1] # sampling for exploration
-
-                # update x
-                x = self._F(x, self._g(v[k, t-1]))
-
-                # add stage cost
-                S[k] += self._c(x) + self.param_gamma * u[t-1].T @ np.linalg.inv(self.Sigma) @ v[k, t-1]
-
-            # add terminal cost
-            S[k] += self._phi(x)
+        # rollout all K samples at once
+        S = self.param_gamma * np.einsum('ti,ij,ktj->k', u, self.Sigma_inv, v)
+        traj = np.zeros((self.K, self.T, self.dim_x))
+        x = np.tile(x0, (self.K, 1))
+        for t in range(self.T):
+            x = self._F(x, v[:, t])
+            traj[:, t] = x
+            S += self._c(x)
+        S += self._phi(x)
 
         # compute information theoretic weights for each sample
         w = self._compute_weights(S)
 
         # calculate w_k * epsilon_k
-        w_epsilon = np.zeros((self.T, self.dim_u))
-        for t in range(0, self.T): # loop for time step t = 0 ~ T-1
-            for k in range(self.K):
-                w_epsilon[t] += w[k] * epsilon[k, t]
+        w_epsilon = np.einsum('k,ktu->tu', w, epsilon)
 
         # apply moving average filter for smoothing input sequence
         w_epsilon = self._moving_average_filter(xx=w_epsilon, window_size=10)
@@ -116,20 +99,14 @@ class MPPIControllerForPathTracking():
         # calculate optimal trajectory
         optimal_traj = np.zeros((self.T, self.dim_x))
         if self.visualize_optimal_traj:
-            x = x0
+            np.clip(u, -self.u_limit, self.u_limit, out=u)
+            x = x0[None]
             for t in range(0, self.T): # loop for time step t = 0 ~ T-1
-                x = self._F(x, self._g(u[t]))
-                optimal_traj[t] = x
+                x = self._F(x, u[t][None])
+                optimal_traj[t] = x[0]
 
         # calculate sampled trajectories
-        sampled_traj_list = np.zeros((self.K, self.T, self.dim_x))
-        sorted_idx = np.argsort(S) # sort samples by state cost, 0th is the best sample
-        if self.visualze_sampled_trajs:
-            for k in sorted_idx:
-                x = x0
-                for t in range(0, self.T): # loop for time step t = 0 ~ T-1
-                    x = self._F(x, self._g(v[k, t]))
-                    sampled_traj_list[k, t] = x
+        sampled_traj_list = traj if self.visualze_sampled_trajs else np.zeros((self.K, self.T, self.dim_x))
 
         # update privious control input sequence (shift 1 step to the left)
         self.u_prev[:-1] = u[1:]
@@ -150,49 +127,36 @@ class MPPIControllerForPathTracking():
         epsilon = np.random.multivariate_normal(mu, sigma, (size_sample, size_time_step))
         return epsilon
 
-    def _g(self, v: np.ndarray) -> float:
-        """clamp input"""
-        # limit control inputs
-        v[0] = np.clip(v[0], -self.max_steer_abs, self.max_steer_abs) # limit steering input
-        v[1] = np.clip(v[1], -self.max_accel_abs, self.max_accel_abs) # limit acceleraiton input
-        return v
+    def _c(self, x_t: np.ndarray) -> np.ndarray:
+        """calculate stage cost for a batch of states, shape (K, dim_x) -> (K,)"""
+        return self._state_cost(x_t, self.stage_cost_weight)
 
-    def _c(self, x_t: np.ndarray) -> float:
-        """calculate stage cost"""
-        # parse x_t
-        x, y, yaw, v = x_t
-        yaw = ((yaw + 2.0*np.pi) % (2.0*np.pi)) # normalize theta to [0, 2*pi]
+    def _phi(self, x_T: np.ndarray) -> np.ndarray:
+        """calculate terminal cost for a batch of states, shape (K, dim_x) -> (K,)"""
+        return self._state_cost(x_T, self.terminal_cost_weight)
 
-        # calculate stage cost
-        _, ref_x, ref_y, ref_yaw, ref_v = self._get_nearest_waypoint(x, y)
-        yaw_diff = np.arctan2(np.sin(yaw-ref_yaw), np.cos(yaw-ref_yaw)) # normalize yaw error to [-pi, pi]
-        stage_cost = self.stage_cost_weight[0]*(x-ref_x)**2 + self.stage_cost_weight[1]*(y-ref_y)**2 + \
-                     self.stage_cost_weight[2]*(yaw_diff)**2 + self.stage_cost_weight[3]*(v-ref_v)**2
-        return stage_cost
+    def _state_cost(self, x_t: np.ndarray, weight: np.ndarray) -> np.ndarray:
+        ref = self._nearest_ref(x_t[:, :2])
+        err = x_t - ref
+        err[:, 2] = np.arctan2(np.sin(err[:, 2]), np.cos(err[:, 2])) # normalize yaw error to [-pi, pi]
+        return (err**2) @ weight
 
-    def _phi(self, x_T: np.ndarray) -> float:
-        """calculate terminal cost"""
-        # parse x_T
-        x, y, yaw, v = x_T
-        yaw = ((yaw + 2.0*np.pi) % (2.0*np.pi)) # normalize theta to [0, 2*pi]
+    def _nearest_ref(self, xy: np.ndarray) -> np.ndarray:
+        """reference [x, y, yaw, v] of the nearest waypoint for each point in xy, shape (K, 2) -> (K, 4)"""
+        segment = self.ref_path[self._search_window()]
+        d = ((xy[:, None, :] - segment[None, :, :2])**2).sum(axis=2)
+        return segment[d.argmin(axis=1)]
 
-        # calculate terminal cost
-        _, ref_x, ref_y, ref_yaw, ref_v = self._get_nearest_waypoint(x, y)
-        yaw_diff = np.arctan2(np.sin(yaw-ref_yaw), np.cos(yaw-ref_yaw)) # normalize yaw error to [-pi, pi]
-        terminal_cost = self.terminal_cost_weight[0]*(x-ref_x)**2 + self.terminal_cost_weight[1]*(y-ref_y)**2 + \
-                        self.terminal_cost_weight[2]*(yaw_diff)**2 + self.terminal_cost_weight[3]*(v-ref_v)**2
-        return terminal_cost
+    def _search_window(self) -> np.ndarray:
+        """indices of the forward search range, wrapping around since the reference path is a closed loop"""
+        SEARCH_IDX_LEN = 200 # [points] forward search range
+        return (self.prev_waypoints_idx + np.arange(SEARCH_IDX_LEN)) % self.ref_path.shape[0]
 
     def _get_nearest_waypoint(self, x: float, y: float, update_prev_idx: bool = False):
         """search the closest waypoint to the vehicle on the reference path"""
-
-        SEARCH_IDX_LEN = 200 # [points] forward search range
-        prev_idx = self.prev_waypoints_idx
-        dx = [x - ref_x for ref_x in self.ref_path[prev_idx:(prev_idx + SEARCH_IDX_LEN), 0]]
-        dy = [y - ref_y for ref_y in self.ref_path[prev_idx:(prev_idx + SEARCH_IDX_LEN), 1]]
-        d = [idx ** 2 + idy ** 2 for (idx, idy) in zip(dx, dy)]
-        min_d = min(d)
-        nearest_idx = d.index(min_d) + prev_idx
+        idx = self._search_window()
+        d = (x - self.ref_path[idx, 0])**2 + (y - self.ref_path[idx, 1])**2
+        nearest_idx = int(idx[d.argmin()])
 
         # get reference values of the nearest waypoint
         ref_x = self.ref_path[nearest_idx,0]
@@ -207,10 +171,10 @@ class MPPIControllerForPathTracking():
         return nearest_idx, ref_x, ref_y, ref_yaw, ref_v
 
     def _F(self, x_t: np.ndarray, v_t: np.ndarray) -> np.ndarray:
-        """calculate next state of the vehicle"""
+        """calculate next state of the vehicle, shapes (N, dim_x), (N, dim_u) -> (N, dim_x)"""
         # get previous state variables
-        x, y, yaw, v = x_t
-        steer, accel = v_t
+        x, y, yaw, v = x_t.T
+        steer, accel = v_t.T
 
         # prepare params
         l = self.wheel_base
@@ -223,26 +187,13 @@ class MPPIControllerForPathTracking():
         new_v = v + accel * dt
 
         # return updated state
-        x_t_plus_1 = np.array([new_x, new_y, new_yaw, new_v])
+        x_t_plus_1 = np.stack([new_x, new_y, new_yaw, new_v], axis=1)
         return x_t_plus_1
 
     def _compute_weights(self, S: np.ndarray) -> np.ndarray:
         """compute weights for each sample"""
-        # prepare buffer
-        w = np.zeros((self.K))
-
-        # calculate rho
-        rho = S.min()
-
-        # calculate eta
-        eta = 0.0
-        for k in range(self.K):
-            eta += np.exp( (-1.0/self.param_lambda) * (S[k]-rho) )
-
-        # calculate weight
-        for k in range(self.K):
-            w[k] = (1.0 / eta) * np.exp( (-1.0/self.param_lambda) * (S[k]-rho) )
-        return w
+        w = np.exp((-1.0/self.param_lambda) * (S - S.min()))
+        return w / w.sum()
 
     def _moving_average_filter(self, xx: np.ndarray, window_size: int) -> np.ndarray:
         """apply moving average filter for smoothing input sequence
@@ -269,19 +220,20 @@ def run_simulation_mppi_pathtracking() -> None:
 
     # simulation settings
     delta_t = 0.05 # [sec]
-    sim_steps = 1000 # [steps]
-    print(f"[INFO] delta_t : {delta_t:.2f}[s] , sim_steps : {sim_steps}[steps], total_sim_time : {delta_t*sim_steps:.2f}[s]")
+    print(f"[INFO] delta_t : {delta_t:.2f}[s], running until Ctrl+C")
 
     # load the reference path
     ref_path = np.genfromtxt('./data/ovalpath.csv', delimiter=',', skip_header=1)
 
     # initialize a vehicle as a control target
-    vehicle = Vehicle(
+    vehicle_params = dict(
         wheel_base=2.5,
         max_steer_abs=0.523, # [rad]
         max_accel_abs=2.000, # [m/s^2]
         ref_path = ref_path[:, 0:2], # ndarray, size is <num_of_waypoints x 2>
     )
+    vehicle = Vehicle(visualize=False, **vehicle_params)
+    recorder = BackgroundRecorder("mppi_pathtracking_demo.mp4", fps=1.0/delta_t, **vehicle_params) # ffmpeg is required to write mp4 file
     vehicle.reset(
         init_state = np.array([0.0, 1.0, 0.0, 0.0]), # [x[m], y[m], yaw[rad], v[m/s]]
     )
@@ -305,29 +257,28 @@ def run_simulation_mppi_pathtracking() -> None:
     )
 
     # simulation loop
-    for i in range(sim_steps):
+    try:
+        for i in itertools.count():
 
-        # get current state of vehicle
-        current_state = vehicle.get_state()
+            # get current state of vehicle
+            current_state = vehicle.get_state()
 
-        try:
             # calculate input force with MPPI
             optimal_input, optimal_input_sequence, optimal_traj, sampled_traj_list = mppi.calc_control_input(
                 observed_x = current_state
             )
-        except IndexError as e:
-            # the vehicle has reached the end of the reference path
-            print("[ERROR] IndexError detected. Terminate simulation.")
-            break
 
-        # print current state and input force
-        print(f"Time: {i*delta_t:>2.2f}[s], x={current_state[0]:>+3.3f}[m], y={current_state[1]:>+3.3f}[m], yaw={current_state[2]:>+3.3f}[rad], v={current_state[3]:>+3.3f}[m/s], steer={optimal_input[0]:>+6.2f}[rad], accel={optimal_input[1]:>+6.2f}[m/s]")
+            # print current state and input force
+            print(f"Time: {i*delta_t:>2.2f}[s], x={current_state[0]:>+3.3f}[m], y={current_state[1]:>+3.3f}[m], yaw={current_state[2]:>+3.3f}[rad], v={current_state[3]:>+3.3f}[m/s], steer={optimal_input[0]:>+6.2f}[rad], accel={optimal_input[1]:>+6.2f}[m/s]")
 
-        # update states of vehicle
-        vehicle.update(u=optimal_input, delta_t=delta_t, optimal_traj=optimal_traj[:, 0:2], sampled_traj_list=sampled_traj_list[:, :, 0:2])
-
-    # save animation
-    vehicle.save_animation("mppi_pathtracking_demo.mp4", interval=int(delta_t * 1000), movie_writer="ffmpeg") # ffmpeg is required to write mp4 file
+            # update states of vehicle
+            vehicle.update(u=optimal_input, delta_t=delta_t, append_frame=False)
+            recorder.add_frame(vehicle.get_state(), optimal_input[0], optimal_input[1], optimal_traj[:, 0:2], sampled_traj_list[:, :, 0:2])
+    except KeyboardInterrupt:
+        print("[INFO] Ctrl+C detected. Terminate simulation.")
+    finally:
+        print(f"[INFO] Waiting for ~{recorder.queue.qsize()} remaining frames to be written...")
+        recorder.close()
 
 if __name__ == "__main__":
     run_simulation_mppi_pathtracking()
